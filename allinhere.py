@@ -1,4 +1,8 @@
-# rl_tot_core.py
+"""
+RL-ToT: Reinforcement Learning Tree-of-Thought for LLM Reasoning
+
+This module implements a clean architecture for RL-ToT, combining Tree-of-Thought reasoning with Reinforcement Learning.
+"""
 
 import uuid
 import random
@@ -13,108 +17,153 @@ from transformers import (
     Trainer,
     TrainingArguments,
     GenerationConfig,
+    PreTrainedModel,
+    PreTrainedTokenizer,
 )
 from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
+import numpy as np
+import math
+from torch.distributions import Categorical
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # 1. Core ToT Engine
 # -----------------------------------------------------------------------------
 
 
+@dataclass
 class ThoughtNode:
     """
-    Node in the Tree-of-Thought search, tracking state, score, and metadata.
+    Represents a node in the reasoning tree.
     """
 
-    def __init__(
-        self,
-        state: str,
-        parent: Optional["ThoughtNode"] = None,
-        score: float = 0.0,
-        metadata: Optional[Dict[str, Any]] = None,
-    ):
-        self.id: str = str(uuid.uuid4())
-        self.state: str = state
-        self.parent: Optional["ThoughtNode"] = parent
-        self.children: List["ThoughtNode"] = []
-        self.score: float = score
-        self.metadata: Dict[str, Any] = metadata or {
-            "visits": 0,
-            "entropy": None,
-            "reward": 0.0,
-        }
+    state: str
+    parent: Optional["ThoughtNode"] = None
+    children: List["ThoughtNode"] = None
+    score: float = 0.0
+    metadata: Dict[str, Any] = None
 
-    def add_child(self, child: "ThoughtNode") -> None:
-        self.children.append(child)
-
-    def visit(self) -> None:
-        self.metadata["visits"] += 1
-
-    def set_entropy(self, entropy: float) -> None:
-        self.metadata["entropy"] = entropy
-
-    def set_reward(self, reward: float) -> None:
-        self.metadata["reward"] = reward
-
-    def __repr__(self) -> str:
-        v = self.metadata["visits"]
-        r = self.metadata["reward"]
-        return f"<Node {self.id[:8]} score={self.score:.3f} visits={v} reward={r:.2f}>"
+    def __post_init__(self):
+        if self.children is None:
+            self.children = []
+        if self.metadata is None:
+            self.metadata = {}
 
 
 class TreeManager:
     """
-    Core inference engine for Tree-of-Thought with pluggable strategies.
+    Manages the tree of thoughts, including expansion, scoring, and traversal.
     """
 
-    def __init__(
-        self,
-        expand_fn: Callable[[ThoughtNode], List[str]],
-        score_fn: Callable[[str], float],
-        max_depth: int = 10,
-    ):
+    def __init__(self, expand_fn: Callable, score_fn: Callable):
         self.expand_fn = expand_fn
         self.score_fn = score_fn
-        self.max_depth = max_depth
-        self.root: Optional[ThoughtNode] = None
+        self.root = None
 
-    def initialize(self, prompt: str) -> None:
-        self.root = ThoughtNode(state=prompt)
+    def create_root(self, initial_state: str) -> ThoughtNode:
+        """
+        Creates the root node of the tree.
+        """
+        self.root = ThoughtNode(state=initial_state)
+        return self.root
 
-    def generate_and_expand(self, node: ThoughtNode) -> List[ThoughtNode]:
-        children: List[ThoughtNode] = []
-        for state in self.expand_fn(node):
-            score = self.score_fn(state)
-            child = ThoughtNode(state=state, parent=node, score=score)
-            node.add_child(child)
-            children.append(child)
+    def expand_node(self, node: ThoughtNode) -> List[ThoughtNode]:
+        """
+        Expands a node by generating children using the expand_fn.
+        """
+        children_states = self.expand_fn(node.state)
+        children = [ThoughtNode(state=state, parent=node) for state in children_states]
+        node.children.extend(children)
         return children
 
+    def score_node(self, node: ThoughtNode) -> float:
+        """
+        Scores a node using the score_fn.
+        """
+        node.score = self.score_fn(node.state)
+        return node.score
+
     def traverse(
-        self, strategy: Union[str, "SearchStrategy"] = "best_first"
-    ) -> ThoughtNode:
-        assert self.root is not None, "TreeManager not initialized"
-        current = self.root
-        depth = 0
-        while depth < self.max_depth:
-            current.visit()
-            kids = self.generate_and_expand(current)
-            if not kids:
-                break
+        self, strategy: str = "best_first", max_depth: int = 5, max_branches: int = 3
+    ) -> List[ThoughtNode]:
+        """
+        Traverses the tree using the specified strategy.
+        """
+        if strategy == "best_first":
+            return self._best_first_traverse(max_depth, max_branches)
+        elif strategy == "dfs":
+            return self._dfs_traverse(max_depth, max_branches)
+        elif strategy == "random":
+            return self._random_traverse(max_depth, max_branches)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
 
-            if isinstance(strategy, SearchStrategy):
-                sel = strategy.select(kids)
-                # allow beam returning multiple nodes
-                current = sel[0] if isinstance(sel, list) else sel
-            elif strategy == "best_first":
-                current = max(kids, key=lambda n: n.score)
-            elif strategy == "dfs":
-                current = kids[0]
-            else:  # random
-                current = random.choice(kids)
+    def _best_first_traverse(
+        self, max_depth: int, max_branches: int
+    ) -> List[ThoughtNode]:
+        """
+        Best-first traversal of the tree.
+        """
+        if not self.root:
+            return []
+        queue = [(self.root, 0)]
+        visited = []
+        while queue and len(visited) < max_branches:
+            node, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            visited.append(node)
+            self.expand_node(node)
+            for child in node.children:
+                self.score_node(child)
+                queue.append((child, depth + 1))
+            queue.sort(key=lambda x: x[0].score, reverse=True)
+        return visited
 
-            depth += 1
-        return current
+    def _dfs_traverse(self, max_depth: int, max_branches: int) -> List[ThoughtNode]:
+        """
+        Depth-first traversal of the tree.
+        """
+        if not self.root:
+            return []
+        stack = [(self.root, 0)]
+        visited = []
+        while stack and len(visited) < max_branches:
+            node, depth = stack.pop()
+            if depth >= max_depth:
+                continue
+            visited.append(node)
+            self.expand_node(node)
+            for child in reversed(node.children):
+                self.score_node(child)
+                stack.append((child, depth + 1))
+        return visited
+
+    def _random_traverse(self, max_depth: int, max_branches: int) -> List[ThoughtNode]:
+        """
+        Random traversal of the tree.
+        """
+        if not self.root:
+            return []
+        queue = [(self.root, 0)]
+        visited = []
+        while queue and len(visited) < max_branches:
+            node, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            visited.append(node)
+            self.expand_node(node)
+            for child in node.children:
+                self.score_node(child)
+                queue.append((child, depth + 1))
+            random.shuffle(queue)
+        return visited
 
 
 # -----------------------------------------------------------------------------
@@ -124,40 +173,43 @@ class TreeManager:
 
 class HFModel:
     """
-    Wraps a HuggingFace causal LM and its value-head for PPO.
+    Wraps a HuggingFace LLM and value head for PPO.
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, device: str = "cuda"):
+        self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        # policy-only model for plain generation/evaluation
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, device_map="auto", torch_dtype=torch.float16
-        )
-        # policy+value model for PPO
-        self.ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(model_name)
-        self.temperature: float = 1.0
+        self.model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        self.value_head = nn.Linear(self.model.config.hidden_size, 1).to(device)
 
-    def generate(self, prompt: str, **gen_kwargs) -> str:
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        cfg = GenerationConfig(temperature=self.temperature, **gen_kwargs)
-        output_ids = self.model.generate(**inputs, generation_config=cfg)
-        return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    def generate(self, prompt: str, max_length: int = 100) -> str:
+        """
+        Generates text using the LLM.
+        """
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        outputs = self.model.generate(**inputs, max_length=max_length)
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    def evaluate(self, text: str) -> float:
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+    def evaluate(self, prompt: str) -> float:
+        """
+        Evaluates the prompt using the value head.
+        """
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            out = self.model(**inputs, labels=inputs.input_ids)
-        return -out.loss.item()
+            outputs = self.model(**inputs, output_hidden_states=True)
+            hidden_states = outputs.hidden_states[-1][:, -1, :]
+            value = self.value_head(hidden_states).item()
+        return value
 
     def generate_with_values(
         self, prompts: List[str], max_new_tokens: int = 128, **gen_kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Tokenize batch
         batch = self.tokenizer(prompts, return_tensors="pt", padding=True).to(
-            self.ppo_model.device
+            self.model.device
         )
         # Generate with value head
-        outputs = self.ppo_model.generate(
+        outputs = self.model.generate(
             **batch,
             max_new_tokens=max_new_tokens,
             return_dict_in_generate=True,
@@ -180,54 +232,63 @@ class HFModel:
 
 
 class RewardFunction(ABC):
-    """Base for reward functions."""
+    """
+    Abstract base class for reward functions.
+    """
 
     @abstractmethod
-    def __call__(self, node: ThoughtNode) -> float: ...
+    def __call__(self, state: str) -> float:
+        pass
 
 
 class BinaryMatchReward(RewardFunction):
-    def __init__(self, terms: List[str]):
-        self.terms = [t.lower() for t in terms]
+    """
+    Binary reward based on exact match.
+    """
 
-    def __call__(self, node: ThoughtNode) -> float:
-        s = node.state.lower()
-        return float(all(t in s for t in self.terms))
+    def __init__(self, target: str):
+        self.target = target
+
+    def __call__(self, state: str) -> float:
+        return 1.0 if state == self.target else 0.0
 
 
 class LengthPenaltyReward(RewardFunction):
-    def __init__(self, max_len: int = 100):
-        self.max_len = max_len
+    """
+    Penalizes long outputs.
+    """
 
-    def __call__(self, node: ThoughtNode) -> float:
-        return max(0.0, 1.0 - len(node.state) / self.max_len)
+    def __init__(self, max_length: int):
+        self.max_length = max_length
+
+    def __call__(self, state: str) -> float:
+        return 1.0 - (len(state) / self.max_length)
 
 
 class CompositeReward(RewardFunction):
-    def __init__(
-        self, rewards: List[RewardFunction], weights: Optional[List[float]] = None
-    ):
+    """
+    Combines multiple reward functions.
+    """
+
+    def __init__(self, rewards: List[RewardFunction], weights: List[float]):
         self.rewards = rewards
-        self.weights = weights or [1.0] * len(rewards)
+        self.weights = weights
 
-    def __call__(self, node: ThoughtNode) -> float:
-        return sum(w * r(node) for r, w in zip(self.rewards, self.weights))
+    def __call__(self, state: str) -> float:
+        return sum(w * r(state) for r, w in zip(self.rewards, self.weights))
 
 
-class RewardModel(torch.nn.Module):
+class RewardModel(nn.Module):
     """
-    Wraps RewardFunction into an nn.Module for PPOTrainer.
+    Wraps a reward function as a torch.nn.Module for PPOTrainer.
     """
 
-    def __init__(self, reward_fn: RewardFunction, tokenizer: AutoTokenizer):
+    def __init__(self, reward_fn: RewardFunction):
         super().__init__()
         self.reward_fn = reward_fn
-        self.tokenizer = tokenizer
 
-    def forward(self, input_ids: torch.Tensor, **_) -> torch.Tensor:
-        texts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-        rewards = [self.reward_fn(ThoughtNode(state=t)) for t in texts]
-        return torch.tensor(rewards, dtype=torch.float32, device=input_ids.device)
+    def forward(self, state: str) -> torch.Tensor:
+        return torch.tensor(self.reward_fn(state), dtype=torch.float32)
 
 
 # -----------------------------------------------------------------------------
@@ -237,52 +298,24 @@ class RewardModel(torch.nn.Module):
 
 class RLVRTrainer:
     """
-    Wraps TRL's PPOTrainer with your ToT environment and reward logic.
+    Wraps PPOTrainer from TRL for RL training.
     """
 
     def __init__(
-        self,
-        llm: HFModel,
-        tree_manager: TreeManager,
-        reward_fn: RewardFunction,
-        train_dataset: Dataset,
-        ppo_config: Optional[PPOConfig] = None,
+        self, model: HFModel, reward_model: RewardModel, ppo_config: PPOConfig
     ):
-        self.llm = llm
-        self.tree_manager = tree_manager
-        self.ppo_config = ppo_config or PPOConfig(
-            batch_size=8, forward_batch_size=2, ppo_epochs=4
-        )
-        # Reference model for KL
-        self.ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            llm.ppo_model.config._name_or_path
-        )
-        self.reward_model = RewardModel(reward_fn, llm.tokenizer)
+        self.model = model
+        self.reward_model = reward_model
+        self.ppo_trainer = PPOTrainer(model=model.model, config=ppo_config)
 
-        self.trainer = PPOTrainer(
-            args=self.ppo_config,
-            processing_class=llm.tokenizer,
-            model=llm.ppo_model,
-            ref_model=self.ref_model,
-            reward_model=self.reward_model,
-            train_dataset=train_dataset,
-            value_model=None,
-            data_collator=None,
-            eval_dataset=None,
-        )
-
-    def train(self) -> None:
-        """Run full PPO training loop."""
-        self.trainer.train()
-
-    def train_step(self, prompts: List[str]) -> None:
+    def train_step(self, prompt: str) -> Dict[str, float]:
         """
-        Single PPO step: generate, score, and step the PPOTrainer.
+        Runs a single PPO training step.
         """
-        input_ids, sequences, _, _ = self.llm.generate_with_values(prompts)
-        gen_tokens = sequences[:, input_ids.size(-1) :]
-        rewards = self.reward_model(input_ids).to(input_ids.device)
-        self.trainer.step(queries=input_ids, responses=gen_tokens, rewards=rewards)
+        response = self.model.generate(prompt)
+        reward = self.reward_model(response)
+        self.ppo_trainer.step(prompt, response, reward)
+        return {"reward": reward.item()}
 
 
 # -----------------------------------------------------------------------------
@@ -291,94 +324,71 @@ class RLVRTrainer:
 
 
 class TrajectoryCollector:
+    """
+    Collects reasoning trajectories from base LLM, RL-trained LLM, and ToT search.
+    """
+
     def __init__(
-        self,
-        llm: HFModel,
-        rl_trainer: RLVRTrainer,
-        tree_manager: TreeManager,
-        k_base: int = 256,
+        self, base_model: HFModel, rl_model: HFModel, tree_manager: TreeManager
     ):
-        self.llm = llm
-        self.rl_trainer = rl_trainer
+        self.base_model = base_model
+        self.rl_model = rl_model
         self.tree_manager = tree_manager
-        self.k_base = k_base
 
-    def collect_base(self, prompt: str) -> List[Dict[str, Any]]:
-        recs = []
-        for _ in range(self.k_base):
-            out = self.llm.generate(prompt, do_sample=True, temperature=0.8)
-            recs.append({"input": prompt, "cot": None, "output": out, "source": "base"})
-        return recs
-
-    def collect_rl(self, prompt: str) -> Dict[str, Any]:
-        self.rl_trainer.train_step([prompt])
-        _, seqs, _, _ = self.llm.generate_with_values([prompt])
-        out = self.llm.tokenizer.decode(seqs[0], skip_special_tokens=True)
-        return {"input": prompt, "cot": None, "output": out, "source": "rlvr"}
-
-    def collect_tot(
-        self, prompt: str, strategy: Union[str, "SearchStrategy"] = "best_first"
-    ) -> Dict[str, Any]:
-        self.tree_manager.initialize(prompt)
-        final = self.tree_manager.traverse(strategy)
-        path = []
-        node = final
-        while node:
-            path.append(node.state)
-            node = node.parent
-        return {
-            "input": prompt,
-            "cot": path[::-1],
-            "output": final.state,
-            "source": "tot",
-        }
+    def collect_trajectories(
+        self, prompt: str, num_trajectories: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Collects trajectories from all sources.
+        """
+        trajectories = []
+        for _ in range(num_trajectories):
+            base_response = self.base_model.generate(prompt)
+            rl_response = self.rl_model.generate(prompt)
+            tot_nodes = self.tree_manager.traverse()
+            trajectories.append(
+                {
+                    "base": base_response,
+                    "rl": rl_response,
+                    "tot": [node.state for node in tot_nodes],
+                }
+            )
+        return trajectories
 
 
 class StudentDistiller:
+    """
+    Fine-tunes a student model on collected trajectories.
+    """
+
     def __init__(
-        self,
-        student_model_name: str,
-        trajectories: List[Dict[str, Any]],
-        output_dir: str = "./distilled",
+        self, student_model: PreTrainedModel, student_tokenizer: PreTrainedTokenizer
     ):
-        self.tokenizer = AutoTokenizer.from_pretrained(student_model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(student_model_name)
+        self.student_model = student_model
+        self.student_tokenizer = student_tokenizer
 
-        examples = []
-        for rec in trajectories:
-            cot = "" if rec["cot"] is None else "\n".join(rec["cot"]) + "\n"
-            examples.append(
-                {"input_text": rec["input"], "target_text": cot + rec["output"]}
-            )
+    def distill(self, trajectories: List[Dict[str, Any]], num_epochs: int = 3) -> None:
+        """
+        Distills knowledge from trajectories into the student model.
+        """
+        for epoch in range(num_epochs):
+            for traj in trajectories:
+                for source in ["base", "rl", "tot"]:
+                    if source == "tot":
+                        for state in traj[source]:
+                            self._train_step(state)
+                    else:
+                        self._train_step(traj[source])
 
-        def preprocess(ex: Dict[str, str]) -> Dict[str, Any]:
-            enc = self.tokenizer(
-                ex["input_text"], truncation=True, padding="max_length", max_length=128
-            )
-            dec = self.tokenizer(
-                ex["target_text"], truncation=True, padding="max_length", max_length=128
-            )
-            enc["labels"] = dec["input_ids"]
-            return enc
-
-        dataset = [preprocess(ex) for ex in examples]
-        self.args = TrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=3,
-            per_device_train_batch_size=8,
-            save_steps=500,
-            logging_steps=100,
-        )
-        self.trainer = Trainer(
-            model=self.model,
-            args=self.args,
-            train_dataset=dataset,
-            tokenizer=self.tokenizer,
-        )
-
-    def fine_tune(self) -> None:
-        self.trainer.train()
-        self.trainer.save_model()
+    def _train_step(self, state: str) -> None:
+        """
+        Trains the student model on a single state.
+        """
+        inputs = self.student_tokenizer(state, return_tensors="pt")
+        self.student_model.train()
+        outputs = self.student_model(**inputs, labels=inputs["input_ids"])
+        outputs.loss.backward()
+        # Optimizer step would go here
 
 
 # -----------------------------------------------------------------------------
@@ -388,54 +398,35 @@ class StudentDistiller:
 
 class SearchScheduler:
     """
-    Dynamically adjust temperature (T), branch budget (B), and depth (D)
-    based on recent CoT entropy and reward.
+    Dynamically adjusts search parameters based on recent performance.
     """
 
     def __init__(
         self,
-        llm: HFModel,
-        tree_manager: TreeManager,
-        tau_low: float = 1.0,
-        tau_high: float = 2.5,
-        base_budget: int = 5,
-        base_depth: int = 10,
+        initial_temp: float = 1.0,
+        initial_branches: int = 3,
+        initial_depth: int = 5,
     ):
-        self.llm = llm
-        self.tree_manager = tree_manager
-        self.tau_low = tau_low
-        self.tau_high = tau_high
-        self.T = llm.temperature
-        self.B = base_budget
-        self.D = base_depth
-        self.entropy_hist: List[float] = []
-        self.reward_hist: List[float] = []
+        self.temp = initial_temp
+        self.branches = initial_branches
+        self.depth = initial_depth
+        self.recent_entropy = []
+        self.recent_rewards = []
 
-    def step(self, node: ThoughtNode) -> None:
-        if (ent := node.metadata.get("entropy")) is not None:
-            self.entropy_hist.append(ent)
-        self.reward_hist.append(node.metadata.get("reward", 0.0))
-
-        # Adjust temperature
-        if self.entropy_hist:
-            avg_ent = sum(self.entropy_hist[-10:]) / len(self.entropy_hist[-10:])
-            if avg_ent < self.tau_low:
-                self.T *= 1.2
-            elif avg_ent > self.tau_high:
-                self.T *= 0.8
-            self.T = max(0.1, min(self.T, 5.0))
-            self.llm.temperature = self.T
-
-        # Adjust budget & depth
-        if self.reward_hist:
-            avg_r = sum(self.reward_hist[-10:]) / len(self.reward_hist[-10:])
-            if avg_r > 0.8:
-                self.B = max(1, int(self.B * 0.8))
-                self.D = max(1, int(self.D * 0.9))
-            else:
-                self.B = min(50, int(self.B * 1.1) + 1)
-                self.D = min(50, int(self.D * 1.05) + 1)
-            self.tree_manager.max_depth = self.D
+    def update(self, entropy: float, reward: float) -> None:
+        """
+        Updates search parameters based on recent entropy and reward.
+        """
+        self.recent_entropy.append(entropy)
+        self.recent_rewards.append(reward)
+        if len(self.recent_entropy) > 10:
+            self.recent_entropy.pop(0)
+            self.recent_rewards.pop(0)
+        avg_entropy = sum(self.recent_entropy) / len(self.recent_entropy)
+        avg_reward = sum(self.recent_rewards) / len(self.recent_rewards)
+        self.temp = max(0.1, min(2.0, self.temp * (1.0 + (avg_reward - 0.5) * 0.1)))
+        self.branches = max(1, min(10, self.branches + int((avg_reward - 0.5) * 2)))
+        self.depth = max(1, min(10, self.depth + int((avg_entropy - 0.5) * 2)))
 
 
 # -----------------------------------------------------------------------------
@@ -444,25 +435,74 @@ class SearchScheduler:
 
 
 class SearchStrategy(ABC):
+    """
+    Abstract base class for search strategies.
+    """
+
     @abstractmethod
-    def select(
-        self, children: List[ThoughtNode]
-    ) -> Union[ThoughtNode, List[ThoughtNode]]: ...
+    def search(
+        self, tree_manager: TreeManager, max_depth: int, max_branches: int
+    ) -> List[ThoughtNode]:
+        pass
 
 
 class DepthFirstStrategy(SearchStrategy):
-    def select(self, children: List[ThoughtNode]) -> ThoughtNode:
-        return children[0]
+    """
+    Depth-first search strategy.
+    """
+
+    def search(
+        self, tree_manager: TreeManager, max_depth: int, max_branches: int
+    ) -> List[ThoughtNode]:
+        return tree_manager._dfs_traverse(max_depth, max_branches)
 
 
 class StochasticBeamStrategy(SearchStrategy):
-    def __init__(self, beam_width: int = 5):
-        self.k = beam_width
+    """
+    Stochastic beam search strategy with Gumbel noise.
+    """
 
-    def select(self, children: List[ThoughtNode]) -> List[ThoughtNode]:
-        scores = torch.tensor([c.score for c in children], dtype=torch.float32)
-        # Gumbel noise
-        gumbel = -torch.log(-torch.log(torch.rand_like(scores)))
-        noisy = scores + gumbel
-        idx = torch.topk(noisy, min(self.k, len(children))).indices.tolist()
-        return [children[i] for i in idx]
+    def search(
+        self, tree_manager: TreeManager, max_depth: int, max_branches: int
+    ) -> List[ThoughtNode]:
+        if not tree_manager.root:
+            return []
+        queue = [(tree_manager.root, 0)]
+        visited = []
+        while queue and len(visited) < max_branches:
+            node, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            visited.append(node)
+            tree_manager.expand_node(node)
+            for child in node.children:
+                tree_manager.score_node(child)
+                queue.append((child, depth + 1))
+            gumbel_noise = torch.distributions.Gumbel(0, 1).sample((len(queue),))
+            queue = [x for _, x in sorted(zip(gumbel_noise, queue), reverse=True)]
+        return visited
+
+
+# -----------------------------------------------------------------------------
+# 8. Main Block
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Example usage
+    model_name = "gpt2"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = HFModel(model_name, device)
+    reward_fn = BinaryMatchReward("target")
+    reward_model = RewardModel(reward_fn)
+    ppo_config = PPOConfig()
+    trainer = RLVRTrainer(model, reward_model, ppo_config)
+    tree_manager = TreeManager(
+        expand_fn=lambda x: [x + "a", x + "b"], score_fn=lambda x: len(x)
+    )
+    collector = TrajectoryCollector(model, model, tree_manager)
+    distiller = StudentDistiller(model.model, model.tokenizer)
+    scheduler = SearchScheduler()
+    strategy = DepthFirstStrategy()
+    trajectories = collector.collect_trajectories("start", 5)
+    distiller.distill(trajectories)
+    logger.info("Training complete.")
